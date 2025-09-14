@@ -1,0 +1,330 @@
+import os, asyncio, math, time, re, uuid, logging
+from typing import Optional, Dict, Any
+
+import ccxt
+from fastapi import FastAPI
+from telegram import Update, Bot
+from telegram.ext import Application, AIORateLimiter, MessageHandler, filters
+
+# =====================
+#   ENV VARS (REQUIRED)
+# =====================
+TG_TOKEN         = os.getenv("TG_TOKEN")             # Bot Token (BotFather)
+SOURCE_CHAT_ID   = int(os.getenv("SOURCE_CHAT_ID", "0"))  # Channel/Gruppen-ID der Scanner-Signale (wo der Scanner postet)
+DEST_CHAT_ID     = int(os.getenv("DEST_CHAT_ID", "0"))    # Dein privater Chat (nur hier postet der Executor)
+MEXC_API_KEY     = os.getenv("MEXC_API_KEY")
+MEXC_API_SECRET  = os.getenv("MEXC_API_SECRET")
+
+# =====================
+#   PARAMS (EDIT BY ENV)
+# =====================
+LEVERAGE         = int(os.getenv("LEVERAGE", "20"))
+MARGIN_USDT      = float(os.getenv("MARGIN_USDT", "30"))   # pro Trade
+ISOLATED         = os.getenv("ISOLATED", "true").lower() == "true"
+MAX_ENTRY_DEVIATION_PCT = float(os.getenv("MAX_ENTRY_DEV_PCT", "0.30"))  # 0.30% Toleranz
+POST_FILLS       = os.getenv("POST_FILLS", "true").lower() == "true"     # Fill-Updates in DEST_CHAT_ID
+POLL_INTERVAL_S  = int(os.getenv("POLL_INTERVAL_S", "7"))  # für Fill-Monitor (BE-Shift)
+
+# ====== Logging ======
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("executor")
+
+# ====== FastAPI (Health/Status) ======
+app = FastAPI(title="MEXC Futures Executor Bot")
+
+status_state: Dict[str, Any] = {
+    "ok": False,
+    "last_signal": None,
+    "last_order_info": {},
+    "running": False,
+}
+
+# ====== Telegram App (Polling im Hintergrund) ======
+tg_app: Optional[Application] = None
+tg_bot: Optional[Bot] = None
+
+# ====== CCXT MEXC (USDT-Perp) ======
+def build_exchange() -> ccxt.Exchange:
+    if not (MEXC_API_KEY and MEXC_API_SECRET):
+        raise RuntimeError("MEXC_API_KEY / MEXC_API_SECRET fehlen.")
+    ex = ccxt.mexc({
+        "apiKey": MEXC_API_KEY,
+        "secret": MEXC_API_SECRET,
+        "enableRateLimit": True,
+        "options": {"defaultType": "swap"},  # USDT-M perpetual
+    })
+    ex.load_markets()
+    return ex
+
+ex = build_exchange()
+
+# ====== Helpers ======
+def to_swap_symbol(symbol_spot: str) -> str:
+    # "BTC/USDT" -> "BTC/USDT:USDT" (MEXC swap)
+    if symbol_spot.endswith("/USDT"):
+        base = symbol_spot.split("/")[0]
+        return f"{base}/USDT:USDT"
+    return symbol_spot  # falls schon korrekt
+
+SIG_RE = re.compile(
+    r"STRIKT.*?—\s*(?P<symbol>[A-Z0-9/]+)\s+[0-9a-zA-Z]+\s+"
+    r"➡️\s*\*(?P<side>LONG|SHORT)\*\s*.*?"
+    r"Entry:\s*`(?P<entry>[0-9.]+)`.*?"
+    r"TP1:\s*`(?P<tp1>[0-9.]+)`.*?"
+    r"TP2:\s*`(?P<tp2>[0-9.]+)`.*?"
+    r"(TP3:\s*`(?P<tp3>[0-9.]+)`.*?)?"
+    r"SL:\s*`(?P<sl>[0-9.]+)`",
+    re.S | re.I
+)
+
+async def post(msg: str):
+    if tg_bot and DEST_CHAT_ID:
+        try:
+            await tg_bot.send_message(chat_id=DEST_CHAT_ID, text=msg)
+        except Exception as e:
+            log.exception("Telegram send failed: %s", e)
+
+def calc_qty(symbol: str, price: float) -> float:
+    m = ex.market(symbol)
+    # Positionswert = Margin * Leverage
+    notional = MARGIN_USDT * LEVERAGE
+    raw_qty = notional / max(price, 1e-9)
+    # auf Schrittweite runden
+    step = m["limits"]["amount"].get("min", m["precision"]["amount"])
+    precision = m["precision"]["amount"]
+    # ccxt empfiehlt amount_to_precision
+    qty = ex.amount_to_precision(symbol, raw_qty)
+    # Safety: nicht unter min
+    min_amt = m["limits"]["amount"].get("min") or 0
+    if min_amt and float(qty) < float(min_amt):
+        qty = ex.amount_to_precision(symbol, float(min_amt))
+    return float(qty)
+
+async def set_symbol_params(symbol: str):
+    try:
+        # Leverage
+        ex.set_leverage(LEVERAGE, symbol, params={"marginMode": "isolated" if ISOLATED else "cross"})
+        # Margin Mode (einige Börsen erwarten eigenen Call)
+        try:
+            ex.set_margin_mode("isolated" if ISOLATED else "cross", symbol=symbol)
+        except Exception:
+            pass
+    except Exception as e:
+        log.warning("Leverage/MarginMode für %s nicht gesetzt: %s", symbol, e)
+
+def within_dev(cur: float, ref: float, max_pct: float) -> bool:
+    dev = abs(cur - ref) / ref * 100
+    return dev <= max_pct
+
+# ====== Kern: Trade-Logik ======
+async def place_trade_from_signal(sig: Dict[str, Any]):
+    """
+    sig = {symbol, side, entry, tp1, tp2, tp3?, sl}
+    """
+    status_state["last_signal"] = sig
+    symbol_spot = sig["symbol"]
+    side = sig["side"].upper()
+    entry = float(sig["entry"])
+    tp1 = float(sig["tp1"])
+    tp2 = float(sig["tp2"])
+    sl  = float(sig["sl"])
+    symbol = to_swap_symbol(symbol_spot)
+
+    # Preis prüfen
+    ticker = ex.fetch_ticker(symbol)
+    last = float(ticker["last"])
+    if not within_dev(last, entry, MAX_ENTRY_DEVIATION_PCT):
+        await post(f"⚠️ {symbol}: Marktpreis {last:.6f} weicht >{MAX_ENTRY_DEVIATION_PCT:.2f}% vom Entry {entry:.6f} ab → **kein Trade**.")
+        return
+
+    await set_symbol_params(symbol)
+    qty = calc_qty(symbol, entry)
+    if qty <= 0:
+        await post(f"❌ {symbol}: Menge ≤ 0, abgebrochen.")
+        return
+
+    # Richtung
+    is_long = side == "LONG"
+    order_side = "buy" if is_long else "sell"
+    reduce_side_tp1 = "sell" if is_long else "buy"
+    reduce_side_tp2 = reduce_side_tp1
+    reduce_side_sl  = reduce_side_tp1
+
+    cid_base = uuid.uuid4().hex[:12]
+
+    # 1) Entry als LIMIT @Entry
+    entry_order = ex.create_order(symbol, type="limit", side=order_side, amount=qty, price=entry,
+                                  params={"timeInForce": "GTC", "clientOrderId": f"entry-{cid_base}"})
+    await post(f"📥 Entry placed {symbol} {side} {qty} @ {entry:.6f}")
+
+    # 2) TPs (reduceOnly)
+    tp1_qty = ex.amount_to_precision(symbol, qty * 0.5)
+    tp2_qty = ex.amount_to_precision(symbol, qty - float(tp1_qty))
+
+    tp1_order = ex.create_order(symbol, type="limit", side=reduce_side_tp1, amount=tp1_qty, price=tp1,
+                                params={"reduceOnly": True, "timeInForce": "GTC", "clientOrderId": f"tp1-{cid_base}"})
+    tp2_order = ex.create_order(symbol, type="limit", side=reduce_side_tp2, amount=tp2_qty, price=tp2,
+                                params={"reduceOnly": True, "timeInForce": "GTC", "clientOrderId": f"tp2-{cid_base}"})
+    await post(f"🎯 TP1 {tp1_qty} @ {tp1:.6f} | 🎯 TP2 {tp2_qty} @ {tp2:.6f} (reduceOnly)")
+
+    # 3) SL (stop-market) – volle Menge; nach TP1 wird auf BE nachgezogen
+    stop_params = {
+        "reduceOnly": True,
+        # MEXC braucht 'stopPrice' o.ä.; ccxt nutzt params:
+        "stopPrice": sl,
+        "type": "stop_market",
+        "clientOrderId": f"sl-{cid_base}",
+        # fallback keys (exchanges differ):
+        "triggerPrice": sl,
+        "positionSide": "LONG" if is_long else "SHORT",
+    }
+    sl_order = ex.create_order(symbol, type="market", side=reduce_side_sl, amount=qty, params=stop_params)
+    await post(f"🛡 SL gesetzt @ {sl:.6f} (volle Menge)")
+
+    # Monitor-Loop: auf Entry-Fill warten, danach TP/SL überwachen und bei TP1 → SL auf BE
+    status_state["last_order_info"] = {
+        "symbol": symbol, "cid_base": cid_base,
+        "entry_id": entry_order.get("id"),
+        "tp1_id": tp1_order.get("id"),
+        "tp2_id": tp2_order.get("id"),
+        "sl_id": sl_order.get("id"),
+        "entry": entry, "sl": sl,
+        "qty": float(qty), "tp1_qty": float(tp1_qty), "tp2_qty": float(tp2_qty),
+        "side_long": is_long,
+        "be_set": False,
+    }
+
+    asyncio.create_task(monitor_and_be_shift(status_state["last_order_info"]))
+
+
+async def monitor_and_be_shift(info: Dict[str, Any]):
+    """
+    Pollt Orders/Fills. Sobald TP1 vollständig gefüllt ist, wird SL auf BreakEven (Entry) für Restmenge versetzt.
+    """
+    symbol = info["symbol"]
+    be_set = False
+    entry_price = info["entry"]
+    is_long = info["side_long"]
+
+    while True:
+        try:
+            # offene Orders/Fills prüfen
+            # 1) TP1 gefüllt?
+            o_tp1 = None
+            if info.get("tp1_id"):
+                try:
+                    o_tp1 = ex.fetch_order(info["tp1_id"], symbol)
+                except Exception:
+                    o_tp1 = None
+
+            tp1_filled = False
+            if o_tp1 and o_tp1.get("filled") is not None:
+                tp1_filled = float(o_tp1["filled"]) >= float(info["tp1_qty"])
+
+            if tp1_filled and not be_set:
+                # alten SL canceln
+                if info.get("sl_id"):
+                    try:
+                        ex.cancel_order(info["sl_id"], symbol)
+                    except Exception:
+                        pass
+
+                # neuen SL @ BreakEven für Restmenge setzen
+                rest_qty = ex.amount_to_precision(symbol, float(info["tp2_qty"]))
+                reduce_side = "sell" if is_long else "buy"
+                be_params = {
+                    "reduceOnly": True,
+                    "stopPrice": entry_price,
+                    "type": "stop_market",
+                    "clientOrderId": f"slbe-{info['cid_base']}",
+                    "triggerPrice": entry_price,
+                    "positionSide": "LONG" if is_long else "SHORT",
+                }
+                new_sl = ex.create_order(symbol, type="market", side=reduce_side, amount=rest_qty, params=be_params)
+                info["sl_id"] = new_sl.get("id")
+                info["be_set"] = True
+                be_set = True
+                if POST_FILLS:
+                    await post(f"✅ TP1 erreicht → SL auf **BreakEven** ({entry_price:.6f}) für Restmenge {rest_qty}")
+
+            # Exit-Bedingung: beide TPs erledigt oder keine offenen Positionen?
+            pos = None
+            try:
+                # fetchPosition durch ccxt unified: bei manchen Börsen → fetch_positions / fetch_position
+                positions = ex.fetch_positions([symbol])
+                pos = next((p for p in positions if p.get("symbol") == symbol and float(p.get("contracts", 0)) != 0.0), None)
+            except Exception:
+                pos = None
+
+            if not pos:
+                if POST_FILLS:
+                    await post(f"ℹ️ Position auf {symbol} ist flat. Monitor beendet.")
+                return
+
+            await asyncio.sleep(POLL_INTERVAL_S)
+        except Exception as e:
+            log.warning("Monitor-Loop err: %s", e)
+            await asyncio.sleep(POLL_INTERVAL_S)
+
+
+# ====== Signal-Parser ======
+def parse_signal(text: str) -> Optional[Dict[str, Any]]:
+    m = SIG_RE.search(text)
+    if not m:
+        return None
+    gd = m.groupdict()
+    try:
+        return {
+            "symbol": gd["symbol"].upper().strip(),
+            "side": gd["side"].upper().strip(),
+            "entry": float(gd["entry"]),
+            "tp1": float(gd["tp1"]),
+            "tp2": float(gd["tp2"]),
+            "tp3": float(gd["tp3"]) if gd.get("tp3") else None,
+            "sl": float(gd["sl"]),
+        }
+    except Exception:
+        return None
+
+# ====== Telegram Update-Handler (liest NUR SOURCE_CHAT_ID) ======
+async def on_message(update: Update, context):
+    if not update.effective_chat or update.effective_chat.id != SOURCE_CHAT_ID:
+        return  # ignoriere alles andere
+    if not update.effective_message or not update.effective_message.text:
+        return
+
+    txt = update.effective_message.text
+    sig = parse_signal(txt)
+    if not sig:
+        return
+
+    await post(f"📡 Signal empfangen: {sig['symbol']} {sig['side']} | Entry {sig['entry']} | TP1 {sig['tp1']} | TP2 {sig['tp2']} | SL {sig['sl']}")
+    await place_trade_from_signal(sig)
+
+# ====== Startup / Runner ======
+async def start_polling():
+    global tg_app, tg_bot
+    if not TG_TOKEN or not SOURCE_CHAT_ID or not DEST_CHAT_ID:
+        raise RuntimeError("TG_TOKEN / SOURCE_CHAT_ID / DEST_CHAT_ID fehlen.")
+    tg_app = Application.builder().token(TG_TOKEN).rate_limiter(AIORateLimiter()).build()
+    tg_bot = tg_app.bot
+    tg_app.add_handler(MessageHandler(filters.ALL, on_message))
+    status_state["running"] = True
+    await tg_app.initialize()
+    await tg_app.start()
+    # Long-polling als Hintergrund-Task:
+    asyncio.create_task(tg_app.updater.start_polling(drop_pending_updates=True))
+    await post("🚀 Executor gestartet (Polling aktiv).")
+
+@app.on_event("startup")
+async def _on_start():
+    asyncio.create_task(start_polling())
+    status_state["ok"] = True
+
+@app.get("/health")
+async def health():
+    return {"ok": True, "running": status_state["running"]}
+
+@app.get("/status")
+async def status():
+    return status_state

@@ -1,3 +1,4 @@
+# main.py
 import os, asyncio, re, uuid, logging
 from typing import Optional, Dict, Any
 
@@ -236,7 +237,7 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
             "entry": float(gd["entry"]),
             "tp1": float(gd["tp1"]),
             "tp2": float(gd["tp2"]),
-            "tp3": float(gd["tp3"]) if gd.get("tp3") else None,
+            "tp3": float(gd.get("tp3")) if gd.get("tp3") else None,
             "sl": float(gd["sl"]),
         }
     except Exception:
@@ -279,9 +280,24 @@ async def init_exchange_with_retry():
             await asyncio.sleep(3)
     raise RuntimeError("Exchange init failed after retries.")
 
-# ---------- Telegram start (PTB 20.7: kein Loop-Konflikt) ----------
+async def _run_polling_in_thread():
+    """
+    Startet tg_app.run_polling in einem eigenen Thread,
+    damit kein Konflikt mit der FastAPI-Eventloop entsteht.
+    """
+    assert tg_app is not None
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        None,
+        lambda: tg_app.run_polling(
+            drop_pending_updates=True,
+            stop_signals=None,   # keine Signal-Handler -> Render verträglich
+            close_loop=False     # wir verwalten die Main-Loop (FastAPI)
+        )
+    )
+
 async def start_polling():
-    """PTB 20.7: App initialize/start + Updater.start_polling() (nicht blockierend)."""
+    """PTB 20.7: Polling non-blocking in separatem Thread."""
     global tg_app, tg_bot
     try:
         if not TG_TOKEN or not SOURCE_CHAT_ID or not DEST_CHAT_ID:
@@ -291,13 +307,9 @@ async def start_polling():
         tg_bot = tg_app.bot
         tg_app.add_handler(MessageHandler(filters.ALL, on_message))
 
-        # Kein run_polling() verwenden!
-        await tg_app.initialize()
-        await tg_app.start()
-        # Long Polling im Hintergrund
-        tg_app.updater.start_polling(drop_pending_updates=True)
-
         status_state["running"] = True
+        # run_polling blockiert – deshalb in Thread verschieben:
+        asyncio.create_task(_run_polling_in_thread())
         await post("🚀 Executor gestartet (Polling aktiv).")
     except Exception as e:
         status_state["running"] = False
@@ -314,17 +326,6 @@ async def _on_start():
         status_state["ok"] = False
         status_state["err"] = str(e)
         log.exception("Startup error: %s", e)
-
-# Optional: sauberes Stoppen bei Shutdown
-@app.on_event("shutdown")
-async def _on_shutdown():
-    try:
-        if tg_app:
-            tg_app.updater.stop()
-            await tg_app.stop()
-            await tg_app.shutdown()
-    except Exception:
-        pass
 
 # ---------- API ----------
 @app.get("/health")

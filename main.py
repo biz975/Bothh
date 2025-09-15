@@ -279,8 +279,9 @@ async def init_exchange_with_retry():
             await asyncio.sleep(3)
     raise RuntimeError("Exchange init failed after retries.")
 
+# ---------- Telegram start (PTB 20.7: kein Loop-Konflikt) ----------
 async def start_polling():
-    """PTB v21+: run_polling im Hintergrund (keine Signals in Render)."""
+    """PTB 20.7: App initialize/start + Updater.start_polling() (nicht blockierend)."""
     global tg_app, tg_bot
     try:
         if not TG_TOKEN or not SOURCE_CHAT_ID or not DEST_CHAT_ID:
@@ -290,16 +291,13 @@ async def start_polling():
         tg_bot = tg_app.bot
         tg_app.add_handler(MessageHandler(filters.ALL, on_message))
 
-        status_state["running"] = True
+        # Kein run_polling() verwenden!
+        await tg_app.initialize()
+        await tg_app.start()
+        # Long Polling im Hintergrund
+        tg_app.updater.start_polling(drop_pending_updates=True)
 
-        # wichtig: stop_signals=None, damit PTB nicht mit Render-Signals kollidiert
-        asyncio.create_task(
-            tg_app.run_polling(
-                drop_pending_updates=True,
-                stop_signals=None,
-                close_loop=False,
-            )
-        )
+        status_state["running"] = True
         await post("🚀 Executor gestartet (Polling aktiv).")
     except Exception as e:
         status_state["running"] = False
@@ -316,6 +314,17 @@ async def _on_start():
         status_state["ok"] = False
         status_state["err"] = str(e)
         log.exception("Startup error: %s", e)
+
+# Optional: sauberes Stoppen bei Shutdown
+@app.on_event("shutdown")
+async def _on_shutdown():
+    try:
+        if tg_app:
+            tg_app.updater.stop()
+            await tg_app.stop()
+            await tg_app.shutdown()
+    except Exception:
+        pass
 
 # ---------- API ----------
 @app.get("/health")

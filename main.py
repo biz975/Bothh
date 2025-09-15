@@ -9,9 +9,9 @@ from telegram.ext import Application, AIORateLimiter, MessageHandler, filters
 # =====================
 #   ENV VARS (REQUIRED)
 # =====================
-TG_TOKEN         = os.getenv("TG_TOKEN")             # Bot Token (BotFather)
-SOURCE_CHAT_ID   = int(os.getenv("SOURCE_CHAT_ID", "0"))  # Channel/Gruppen-ID der Scanner-Signale (wo der Scanner postet)
-DEST_CHAT_ID     = int(os.getenv("DEST_CHAT_ID", "0"))    # Dein privater Chat (nur hier postet der Executor)
+TG_TOKEN         = os.getenv("TG_TOKEN")                     # Bot Token (BotFather)
+SOURCE_CHAT_ID   = int(os.getenv("SOURCE_CHAT_ID", "0"))     # Kanal/Gruppen-ID der Scanner-Signale
+DEST_CHAT_ID     = int(os.getenv("DEST_CHAT_ID", "0"))       # Ziel (dein privater Chat)
 MEXC_API_KEY     = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET  = os.getenv("MEXC_API_SECRET")
 
@@ -19,11 +19,11 @@ MEXC_API_SECRET  = os.getenv("MEXC_API_SECRET")
 #   PARAMS (EDIT BY ENV)
 # =====================
 LEVERAGE         = int(os.getenv("LEVERAGE", "20"))
-MARGIN_USDT      = float(os.getenv("MARGIN_USDT", "30"))   # pro Trade
+MARGIN_USDT      = float(os.getenv("MARGIN_USDT", "30"))     # pro Trade
 ISOLATED         = os.getenv("ISOLATED", "true").lower() == "true"
-MAX_ENTRY_DEVIATION_PCT = float(os.getenv("MAX_ENTRY_DEV_PCT", "0.30"))  # 0.30% Toleranz
-POST_FILLS       = os.getenv("POST_FILLS", "true").lower() == "true"     # Fill-Updates in DEST_CHAT_ID
-POLL_INTERVAL_S  = int(os.getenv("POLL_INTERVAL_S", "7"))  # für Fill-Monitor (BE-Shift)
+MAX_ENTRY_DEVIATION_PCT = float(os.getenv("MAX_ENTRY_DEV_PCT", "0.30"))  # 0.30% Abweichung erlaubt
+POST_FILLS       = os.getenv("POST_FILLS", "true").lower() == "true"     # Fill-Updates im Zielchat
+POLL_INTERVAL_S  = int(os.getenv("POLL_INTERVAL_S", "7"))    # Poll-Intervall für BE-Shift
 
 # ====== Logging ======
 logging.basicConfig(level=logging.INFO)
@@ -64,7 +64,7 @@ def to_swap_symbol(symbol_spot: str) -> str:
     if symbol_spot.endswith("/USDT"):
         base = symbol_spot.split("/")[0]
         return f"{base}/USDT:USDT"
-    return symbol_spot  # falls schon korrekt
+    return symbol_spot
 
 SIG_RE = re.compile(
     r"STRIKT.*?—\s*(?P<symbol>[A-Z0-9/]+)\s+[0-9a-zA-Z]+\s+"
@@ -86,15 +86,9 @@ async def post(msg: str):
 
 def calc_qty(symbol: str, price: float) -> float:
     m = ex.market(symbol)
-    # Positionswert = Margin * Leverage
     notional = MARGIN_USDT * LEVERAGE
     raw_qty = notional / max(price, 1e-9)
-    # auf Schrittweite runden
-    step = m["limits"]["amount"].get("min", m["precision"]["amount"])
-    precision = m["precision"]["amount"]
-    # ccxt empfiehlt amount_to_precision
     qty = ex.amount_to_precision(symbol, raw_qty)
-    # Safety: nicht unter min
     min_amt = m["limits"]["amount"].get("min") or 0
     if min_amt and float(qty) < float(min_amt):
         qty = ex.amount_to_precision(symbol, float(min_amt))
@@ -102,9 +96,7 @@ def calc_qty(symbol: str, price: float) -> float:
 
 async def set_symbol_params(symbol: str):
     try:
-        # Leverage
         ex.set_leverage(LEVERAGE, symbol, params={"marginMode": "isolated" if ISOLATED else "cross"})
-        # Margin Mode (einige Börsen erwarten eigenen Call)
         try:
             ex.set_margin_mode("isolated" if ISOLATED else "cross", symbol=symbol)
         except Exception:
@@ -118,9 +110,6 @@ def within_dev(cur: float, ref: float, max_pct: float) -> bool:
 
 # ====== Kern: Trade-Logik ======
 async def place_trade_from_signal(sig: Dict[str, Any]):
-    """
-    sig = {symbol, side, entry, tp1, tp2, tp3?, sl}
-    """
     status_state["last_signal"] = sig
     symbol_spot = sig["symbol"]
     side = sig["side"].upper()
@@ -130,7 +119,6 @@ async def place_trade_from_signal(sig: Dict[str, Any]):
     sl  = float(sig["sl"])
     symbol = to_swap_symbol(symbol_spot)
 
-    # Preis prüfen
     ticker = ex.fetch_ticker(symbol)
     last = float(ticker["last"])
     if not within_dev(last, entry, MAX_ENTRY_DEVIATION_PCT):
@@ -143,45 +131,38 @@ async def place_trade_from_signal(sig: Dict[str, Any]):
         await post(f"❌ {symbol}: Menge ≤ 0, abgebrochen.")
         return
 
-    # Richtung
     is_long = side == "LONG"
     order_side = "buy" if is_long else "sell"
-    reduce_side_tp1 = "sell" if is_long else "buy"
-    reduce_side_tp2 = reduce_side_tp1
-    reduce_side_sl  = reduce_side_tp1
-
+    reduce_side = "sell" if is_long else "buy"
     cid_base = uuid.uuid4().hex[:12]
 
-    # 1) Entry als LIMIT @Entry
+    # Entry
     entry_order = ex.create_order(symbol, type="limit", side=order_side, amount=qty, price=entry,
                                   params={"timeInForce": "GTC", "clientOrderId": f"entry-{cid_base}"})
     await post(f"📥 Entry placed {symbol} {side} {qty} @ {entry:.6f}")
 
-    # 2) TPs (reduceOnly)
+    # TPs (reduceOnly)
     tp1_qty = ex.amount_to_precision(symbol, qty * 0.5)
     tp2_qty = ex.amount_to_precision(symbol, qty - float(tp1_qty))
 
-    tp1_order = ex.create_order(symbol, type="limit", side=reduce_side_tp1, amount=tp1_qty, price=tp1,
+    tp1_order = ex.create_order(symbol, type="limit", side=reduce_side, amount=tp1_qty, price=tp1,
                                 params={"reduceOnly": True, "timeInForce": "GTC", "clientOrderId": f"tp1-{cid_base}"})
-    tp2_order = ex.create_order(symbol, type="limit", side=reduce_side_tp2, amount=tp2_qty, price=tp2,
+    tp2_order = ex.create_order(symbol, type="limit", side=reduce_side, amount=tp2_qty, price=tp2,
                                 params={"reduceOnly": True, "timeInForce": "GTC", "clientOrderId": f"tp2-{cid_base}"})
     await post(f"🎯 TP1 {tp1_qty} @ {tp1:.6f} | 🎯 TP2 {tp2_qty} @ {tp2:.6f} (reduceOnly)")
 
-    # 3) SL (stop-market) – volle Menge; nach TP1 wird auf BE nachgezogen
+    # SL (stop-market) – volle Menge; später BE-Shift
     stop_params = {
         "reduceOnly": True,
-        # MEXC braucht 'stopPrice' o.ä.; ccxt nutzt params:
         "stopPrice": sl,
         "type": "stop_market",
         "clientOrderId": f"sl-{cid_base}",
-        # fallback keys (exchanges differ):
         "triggerPrice": sl,
         "positionSide": "LONG" if is_long else "SHORT",
     }
-    sl_order = ex.create_order(symbol, type="market", side=reduce_side_sl, amount=qty, params=stop_params)
+    sl_order = ex.create_order(symbol, type="market", side=reduce_side, amount=qty, params=stop_params)
     await post(f"🛡 SL gesetzt @ {sl:.6f} (volle Menge)")
 
-    # Monitor-Loop: auf Entry-Fill warten, danach TP/SL überwachen und bei TP1 → SL auf BE
     status_state["last_order_info"] = {
         "symbol": symbol, "cid_base": cid_base,
         "entry_id": entry_order.get("id"),
@@ -196,11 +177,7 @@ async def place_trade_from_signal(sig: Dict[str, Any]):
 
     asyncio.create_task(monitor_and_be_shift(status_state["last_order_info"]))
 
-
 async def monitor_and_be_shift(info: Dict[str, Any]):
-    """
-    Pollt Orders/Fills. Sobald TP1 vollständig gefüllt ist, wird SL auf BreakEven (Entry) für Restmenge versetzt.
-    """
     symbol = info["symbol"]
     be_set = False
     entry_price = info["entry"]
@@ -208,8 +185,6 @@ async def monitor_and_be_shift(info: Dict[str, Any]):
 
     while True:
         try:
-            # offene Orders/Fills prüfen
-            # 1) TP1 gefüllt?
             o_tp1 = None
             if info.get("tp1_id"):
                 try:
@@ -222,14 +197,12 @@ async def monitor_and_be_shift(info: Dict[str, Any]):
                 tp1_filled = float(o_tp1["filled"]) >= float(info["tp1_qty"])
 
             if tp1_filled and not be_set:
-                # alten SL canceln
                 if info.get("sl_id"):
                     try:
                         ex.cancel_order(info["sl_id"], symbol)
                     except Exception:
                         pass
 
-                # neuen SL @ BreakEven für Restmenge setzen
                 rest_qty = ex.amount_to_precision(symbol, float(info["tp2_qty"]))
                 reduce_side = "sell" if is_long else "buy"
                 be_params = {
@@ -247,10 +220,7 @@ async def monitor_and_be_shift(info: Dict[str, Any]):
                 if POST_FILLS:
                     await post(f"✅ TP1 erreicht → SL auf **BreakEven** ({entry_price:.6f}) für Restmenge {rest_qty}")
 
-            # Exit-Bedingung: beide TPs erledigt oder keine offenen Positionen?
-            pos = None
             try:
-                # fetchPosition durch ccxt unified: bei manchen Börsen → fetch_positions / fetch_position
                 positions = ex.fetch_positions([symbol])
                 pos = next((p for p in positions if p.get("symbol") == symbol and float(p.get("contracts", 0)) != 0.0), None)
             except Exception:
@@ -265,7 +235,6 @@ async def monitor_and_be_shift(info: Dict[str, Any]):
         except Exception as e:
             log.warning("Monitor-Loop err: %s", e)
             await asyncio.sleep(POLL_INTERVAL_S)
-
 
 # ====== Signal-Parser ======
 def parse_signal(text: str) -> Optional[Dict[str, Any]]:
@@ -289,7 +258,7 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
 # ====== Telegram Update-Handler (liest NUR SOURCE_CHAT_ID) ======
 async def on_message(update: Update, context):
     if not update.effective_chat or update.effective_chat.id != SOURCE_CHAT_ID:
-        return  # ignoriere alles andere
+        return
     if not update.effective_message or not update.effective_message.text:
         return
 
@@ -312,7 +281,6 @@ async def start_polling():
     status_state["running"] = True
     await tg_app.initialize()
     await tg_app.start()
-    # Long-polling als Hintergrund-Task:
     asyncio.create_task(tg_app.updater.start_polling(drop_pending_updates=True))
     await post("🚀 Executor gestartet (Polling aktiv).")
 

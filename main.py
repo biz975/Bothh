@@ -280,23 +280,26 @@ async def init_exchange_with_retry():
     raise RuntimeError("Exchange init failed after retries.")
 
 async def start_polling():
+    """PTB v20+: run_polling statt Updater.start_polling"""
     global tg_app, tg_bot
     if not TG_TOKEN or not SOURCE_CHAT_ID or not DEST_CHAT_ID:
         raise RuntimeError("TG_TOKEN / SOURCE_CHAT_ID / DEST_CHAT_ID fehlen.")
+
     tg_app = Application.builder().token(TG_TOKEN).rate_limiter(AIORateLimiter()).build()
     tg_bot = tg_app.bot
     tg_app.add_handler(MessageHandler(filters.ALL, on_message))
     status_state["running"] = True
-    await tg_app.initialize()
-    await tg_app.start()
-    asyncio.create_task(tg_app.updater.start_polling(drop_pending_updates=True))
+
+    # Nicht blockieren: im Hintergrund laufen lassen
+    asyncio.create_task(tg_app.run_polling(drop_pending_updates=True))
     await post("🚀 Executor gestartet (Polling aktiv).")
 
 @app.on_event("startup")
 async def _on_start():
     try:
         await init_exchange_with_retry()
-        await start_polling()
+        # Telegram-Polling im Hintergrund starten
+        asyncio.create_task(start_polling())
         status_state["ok"] = True
         status_state["err"] = None
     except Exception as e:
@@ -307,7 +310,12 @@ async def _on_start():
 # ---------- API ----------
 @app.get("/health")
 async def health():
-    return {"ok": status_state["ok"], "running": status_state["running"], "exchange_ok": status_state["exchange_ok"], "err": status_state["err"]}
+    return {
+        "ok": status_state["ok"],
+        "running": status_state["running"],
+        "exchange_ok": status_state["exchange_ok"],
+        "err": status_state["err"],
+    }
 
 @app.get("/status")
 async def status():

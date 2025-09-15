@@ -1,5 +1,5 @@
 # main.py
-import os, asyncio, re, uuid, logging
+import os, re, uuid, logging, asyncio, threading
 from typing import Optional, Dict, Any
 
 import ccxt
@@ -11,8 +11,8 @@ from telegram.ext import Application, AIORateLimiter, MessageHandler, filters
 #   ENV VARS (REQUIRED)
 # =====================
 TG_TOKEN        = os.getenv("TG_TOKEN")
-SOURCE_CHAT_ID  = int(os.getenv("SOURCE_CHAT_ID", "0"))   # Kanal/Gruppen-ID der Signale
-DEST_CHAT_ID    = int(os.getenv("DEST_CHAT_ID", "0"))     # dein privater Chat
+SOURCE_CHAT_ID  = int(os.getenv("SOURCE_CHAT_ID", "0"))   # Kanal/Gruppen-ID für Signale
+DEST_CHAT_ID    = int(os.getenv("DEST_CHAT_ID", "0"))     # Dein privater Chat
 MEXC_API_KEY    = os.getenv("MEXC_API_KEY")
 MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 
@@ -237,7 +237,7 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
             "entry": float(gd["entry"]),
             "tp1": float(gd["tp1"]),
             "tp2": float(gd["tp2"]),
-            "tp3": float(gd.get("tp3")) if gd.get("tp3") else None,
+            "tp3": float(gd["tp3"]) if gd.get("tp3") else None,
             "sl": float(gd["sl"]),
         }
     except Exception:
@@ -280,48 +280,35 @@ async def init_exchange_with_retry():
             await asyncio.sleep(3)
     raise RuntimeError("Exchange init failed after retries.")
 
-async def _run_polling_in_thread():
-    """
-    Startet tg_app.run_polling in einem eigenen Thread,
-    damit kein Konflikt mit der FastAPI-Eventloop entsteht.
-    """
-    assert tg_app is not None
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(
-        None,
-        lambda: tg_app.run_polling(
-            drop_pending_updates=True,
-            stop_signals=None,   # keine Signal-Handler -> Render verträglich
-            close_loop=False     # wir verwalten die Main-Loop (FastAPI)
-        )
-    )
+def start_polling_in_thread():
+    """Startet PTB.run_polling() in einem separaten Thread (eigene Event-Loop)."""
+    def _runner():
+        global tg_app, tg_bot
+        try:
+            app_ = Application.builder().token(TG_TOKEN).rate_limiter(AIORateLimiter()).build()
+            tg_app = app_
+            tg_bot = app_.bot
+            app_.add_handler(MessageHandler(filters.ALL, on_message))
+            status_state["running"] = True
 
-async def start_polling():
-    """PTB 20.7: Polling non-blocking in separatem Thread."""
-    global tg_app, tg_bot
-    try:
-        if not TG_TOKEN or not SOURCE_CHAT_ID or not DEST_CHAT_ID:
-            raise RuntimeError("TG_TOKEN / SOURCE_CHAT_ID / DEST_CHAT_ID fehlen.")
+            # Wichtig: keine OS-Signale im Thread
+            app_.run_polling(drop_pending_updates=True, stop_signals=None)
+        except Exception as e:
+            status_state["running"] = False
+            status_state["err"] = f"Telegram start failed: {e}"
+            log.exception("Telegram start failed: %s", e)
 
-        tg_app = Application.builder().token(TG_TOKEN).rate_limiter(AIORateLimiter()).build()
-        tg_bot = tg_app.bot
-        tg_app.add_handler(MessageHandler(filters.ALL, on_message))
-
-        status_state["running"] = True
-        # run_polling blockiert – deshalb in Thread verschieben:
-        asyncio.create_task(_run_polling_in_thread())
-        await post("🚀 Executor gestartet (Polling aktiv).")
-    except Exception as e:
-        status_state["running"] = False
-        status_state["err"] = f"Telegram start failed: {e}"
-        log.exception("Telegram start failed: %s", e)
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
 
 @app.on_event("startup")
 async def _on_start():
     try:
         await init_exchange_with_retry()
-        await start_polling()
+        # Telegram-Polling in separatem Thread (verhindert Loop-Konflikte auf Render)
+        start_polling_in_thread()
         status_state["ok"] = True
+        # err bleibt ggf. gesetzt, falls Thread-Start fehlschlägt
     except Exception as e:
         status_state["ok"] = False
         status_state["err"] = str(e)

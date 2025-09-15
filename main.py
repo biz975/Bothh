@@ -1,4 +1,4 @@
-import os, asyncio, math, time, re, uuid, logging
+import os, asyncio, re, uuid, logging
 from typing import Optional, Dict, Any
 
 import ccxt
@@ -113,7 +113,7 @@ async def place_trade_from_signal(sig: Dict[str, Any]):
     ticker = ex.fetch_ticker(symbol)
     last = float(ticker["last"])
     if not within_dev(last, entry, MAX_ENTRY_DEVIATION_PCT):
-        await post(f"⚠️ {symbol}: Marktpreis {last:.6f} weicht >{MAX_ENTRY_DEVIATION_PCT:.2f}% von Entry {entry:.6f} ab → **kein Trade**.")
+        await post(f"⚠️ {symbol}: Marktpreis {last:.6f} weicht >{MAX_ENTRY_DEVIATION_PCT:.2f}% vom Entry {entry:.6f} ab → **kein Trade**.")
         return
 
     await set_symbol_params(symbol)
@@ -191,7 +191,7 @@ async def monitor_and_be_shift(info: Dict[str, Any]):
                     except Exception:
                         pass
                 rest_qty = ex.amount_to_precision(symbol, float(info["tp2_qty"]))
-                reduce_side = "sell" if is_long else "buy"
+                reduce_side2 = "sell" if is_long else "buy"
                 be_params = {
                     "reduceOnly": True,
                     "stopPrice": entry_price,
@@ -200,7 +200,7 @@ async def monitor_and_be_shift(info: Dict[str, Any]):
                     "triggerPrice": entry_price,
                     "positionSide": "LONG" if is_long else "SHORT",
                 }
-                new_sl = ex.create_order(symbol, type="market", side=reduce_side, amount=rest_qty, params=be_params)
+                new_sl = ex.create_order(symbol, type="market", side=reduce_side2, amount=rest_qty, params=be_params)
                 info["sl_id"] = new_sl.get("id")
                 info["be_set"] = True
                 be_set = True
@@ -280,33 +280,40 @@ async def init_exchange_with_retry():
     raise RuntimeError("Exchange init failed after retries.")
 
 async def start_polling():
-    """PTB v20+/v21: run_polling im Hintergrund (nicht blockierend)."""
+    """PTB v20+/v21: run_polling im Hintergrund (nicht blockierend)"""
     global tg_app, tg_bot
-    if not TG_TOKEN or not SOURCE_CHAT_ID or not DEST_CHAT_ID:
-        raise RuntimeError("TG_TOKEN / SOURCE_CHAT_ID / DEST_CHAT_ID fehlen.")
+    try:
+        if not TG_TOKEN or not SOURCE_CHAT_ID or not DEST_CHAT_ID:
+            raise RuntimeError("TG_TOKEN / SOURCE_CHAT_ID / DEST_CHAT_ID fehlen.")
 
-    tg_app = Application.builder().token(TG_TOKEN).rate_limiter(AIORateLimiter()).build()
-    tg_bot = tg_app.bot
-    tg_app.add_handler(MessageHandler(filters.ALL, on_message))
+        tg_app = Application.builder().token(TG_TOKEN).rate_limiter(AIORateLimiter()).build()
+        tg_bot = tg_app.bot
+        tg_app.add_handler(MessageHandler(filters.ALL, on_message))
 
-    status_state["running"] = True
-    # run_polling ist ein Coroutine; als Hintergrund-Task starten:
-    asyncio.create_task(
-        tg_app.run_polling(
-            close_loop=False,
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
+        status_state["running"] = True
+
+        # als dauerhafte Hintergrund-Task starten
+        asyncio.create_task(
+            tg_app.run_polling(
+                drop_pending_updates=True,
+                close_loop=False,
+                allowed_updates=Update.ALL_TYPES,
+            )
         )
-    )
-    await post("🚀 Executor gestartet (Polling aktiv).")
+        await post("🚀 Executor gestartet (Polling aktiv).")
+    except Exception as e:
+        status_state["running"] = False
+        status_state["err"] = f"Telegram start failed: {e}"
+        log.exception("Telegram start failed: %s", e)
 
 @app.on_event("startup")
 async def _on_start():
     try:
         await init_exchange_with_retry()
-        asyncio.create_task(start_polling())
+        # Telegram-Polling starten (und NICHT nochmals create_task darum)
+        await start_polling()
         status_state["ok"] = True
-        status_state["err"] = None
+        # err bleibt ggf. aus start_polling erhalten
     except Exception as e:
         status_state["ok"] = False
         status_state["err"] = str(e)

@@ -9,27 +9,27 @@ from telegram.ext import Application, AIORateLimiter, MessageHandler, filters
 # =====================
 #   ENV VARS (REQUIRED)
 # =====================
-TG_TOKEN         = os.getenv("TG_TOKEN")                     # Bot Token (BotFather)
-SOURCE_CHAT_ID   = int(os.getenv("SOURCE_CHAT_ID", "0"))     # Kanal/Gruppen-ID der Scanner-Signale
-DEST_CHAT_ID     = int(os.getenv("DEST_CHAT_ID", "0"))       # Ziel (dein privater Chat)
-MEXC_API_KEY     = os.getenv("MEXC_API_KEY")
-MEXC_API_SECRET  = os.getenv("MEXC_API_SECRET")
+TG_TOKEN        = os.getenv("TG_TOKEN")
+SOURCE_CHAT_ID  = int(os.getenv("SOURCE_CHAT_ID", "0"))   # Kanal/Gruppen-ID der Signale
+DEST_CHAT_ID    = int(os.getenv("DEST_CHAT_ID", "0"))     # dein privater Chat
+MEXC_API_KEY    = os.getenv("MEXC_API_KEY")
+MEXC_API_SECRET = os.getenv("MEXC_API_SECRET")
 
 # =====================
-#   PARAMS (EDIT BY ENV)
+#   PARAMS (ENV-override)
 # =====================
-LEVERAGE         = int(os.getenv("LEVERAGE", "20"))
-MARGIN_USDT      = float(os.getenv("MARGIN_USDT", "30"))     # pro Trade
-ISOLATED         = os.getenv("ISOLATED", "true").lower() == "true"
-MAX_ENTRY_DEVIATION_PCT = float(os.getenv("MAX_ENTRY_DEV_PCT", "0.30"))  # 0.30% Abweichung erlaubt
-POST_FILLS       = os.getenv("POST_FILLS", "true").lower() == "true"     # Fill-Updates im Zielchat
-POLL_INTERVAL_S  = int(os.getenv("POLL_INTERVAL_S", "7"))    # Poll-Intervall für BE-Shift
+LEVERAGE  = int(os.getenv("LEVERAGE", "20"))
+MARGIN_USDT = float(os.getenv("MARGIN_USDT", "30"))
+ISOLATED  = os.getenv("ISOLATED", "true").lower() == "true"
+MAX_ENTRY_DEVIATION_PCT = float(os.getenv("MAX_ENTRY_DEV_PCT", "0.30"))
+POST_FILLS = os.getenv("POST_FILLS", "true").lower() == "true"
+POLL_INTERVAL_S = int(os.getenv("POLL_INTERVAL_S", "7"))
 
 # ====== Logging ======
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("executor")
 
-# ====== FastAPI (Health/Status) ======
+# ====== FastAPI ======
 app = FastAPI(title="MEXC Futures Executor Bot")
 
 status_state: Dict[str, Any] = {
@@ -37,30 +37,17 @@ status_state: Dict[str, Any] = {
     "last_signal": None,
     "last_order_info": {},
     "running": False,
+    "exchange_ok": False,
+    "err": None,
 }
 
-# ====== Telegram App (Polling im Hintergrund) ======
+# ====== Telegram & Exchange (lazy init) ======
 tg_app: Optional[Application] = None
 tg_bot: Optional[Bot] = None
+ex: Optional[ccxt.Exchange] = None
 
-# ====== CCXT MEXC (USDT-Perp) ======
-def build_exchange() -> ccxt.Exchange:
-    if not (MEXC_API_KEY and MEXC_API_SECRET):
-        raise RuntimeError("MEXC_API_KEY / MEXC_API_SECRET fehlen.")
-    ex = ccxt.mexc({
-        "apiKey": MEXC_API_KEY,
-        "secret": MEXC_API_SECRET,
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap"},  # USDT-M perpetual
-    })
-    ex.load_markets()
-    return ex
-
-ex = build_exchange()
-
-# ====== Helpers ======
+# ---------- Helpers ----------
 def to_swap_symbol(symbol_spot: str) -> str:
-    # "BTC/USDT" -> "BTC/USDT:USDT" (MEXC swap)
     if symbol_spot.endswith("/USDT"):
         base = symbol_spot.split("/")[0]
         return f"{base}/USDT:USDT"
@@ -84,7 +71,12 @@ async def post(msg: str):
         except Exception as e:
             log.exception("Telegram send failed: %s", e)
 
+def within_dev(cur: float, ref: float, max_pct: float) -> bool:
+    dev = abs(cur - ref) / ref * 100
+    return dev <= max_pct
+
 def calc_qty(symbol: str, price: float) -> float:
+    assert ex is not None
     m = ex.market(symbol)
     notional = MARGIN_USDT * LEVERAGE
     raw_qty = notional / max(price, 1e-9)
@@ -95,6 +87,7 @@ def calc_qty(symbol: str, price: float) -> float:
     return float(qty)
 
 async def set_symbol_params(symbol: str):
+    assert ex is not None
     try:
         ex.set_leverage(LEVERAGE, symbol, params={"marginMode": "isolated" if ISOLATED else "cross"})
         try:
@@ -104,13 +97,11 @@ async def set_symbol_params(symbol: str):
     except Exception as e:
         log.warning("Leverage/MarginMode für %s nicht gesetzt: %s", symbol, e)
 
-def within_dev(cur: float, ref: float, max_pct: float) -> bool:
-    dev = abs(cur - ref) / ref * 100
-    return dev <= max_pct
-
-# ====== Kern: Trade-Logik ======
+# ---------- Core trading ----------
 async def place_trade_from_signal(sig: Dict[str, Any]):
+    assert ex is not None
     status_state["last_signal"] = sig
+
     symbol_spot = sig["symbol"]
     side = sig["side"].upper()
     entry = float(sig["entry"])
@@ -122,7 +113,7 @@ async def place_trade_from_signal(sig: Dict[str, Any]):
     ticker = ex.fetch_ticker(symbol)
     last = float(ticker["last"])
     if not within_dev(last, entry, MAX_ENTRY_DEVIATION_PCT):
-        await post(f"⚠️ {symbol}: Marktpreis {last:.6f} weicht >{MAX_ENTRY_DEVIATION_PCT:.2f}% vom Entry {entry:.6f} ab → **kein Trade**.")
+        await post(f"⚠️ {symbol}: Marktpreis {last:.6f} weicht >{MAX_ENTRY_DEVIATION_PCT:.2f}% von Entry {entry:.6f} ab → **kein Trade**.")
         return
 
     await set_symbol_params(symbol)
@@ -136,12 +127,10 @@ async def place_trade_from_signal(sig: Dict[str, Any]):
     reduce_side = "sell" if is_long else "buy"
     cid_base = uuid.uuid4().hex[:12]
 
-    # Entry
     entry_order = ex.create_order(symbol, type="limit", side=order_side, amount=qty, price=entry,
                                   params={"timeInForce": "GTC", "clientOrderId": f"entry-{cid_base}"})
     await post(f"📥 Entry placed {symbol} {side} {qty} @ {entry:.6f}")
 
-    # TPs (reduceOnly)
     tp1_qty = ex.amount_to_precision(symbol, qty * 0.5)
     tp2_qty = ex.amount_to_precision(symbol, qty - float(tp1_qty))
 
@@ -151,8 +140,7 @@ async def place_trade_from_signal(sig: Dict[str, Any]):
                                 params={"reduceOnly": True, "timeInForce": "GTC", "clientOrderId": f"tp2-{cid_base}"})
     await post(f"🎯 TP1 {tp1_qty} @ {tp1:.6f} | 🎯 TP2 {tp2_qty} @ {tp2:.6f} (reduceOnly)")
 
-    # SL (stop-market) – volle Menge; später BE-Shift
-    stop_params = {
+    sl_params = {
         "reduceOnly": True,
         "stopPrice": sl,
         "type": "stop_market",
@@ -160,7 +148,7 @@ async def place_trade_from_signal(sig: Dict[str, Any]):
         "triggerPrice": sl,
         "positionSide": "LONG" if is_long else "SHORT",
     }
-    sl_order = ex.create_order(symbol, type="market", side=reduce_side, amount=qty, params=stop_params)
+    sl_order = ex.create_order(symbol, type="market", side=reduce_side, amount=qty, params=sl_params)
     await post(f"🛡 SL gesetzt @ {sl:.6f} (volle Menge)")
 
     status_state["last_order_info"] = {
@@ -174,10 +162,10 @@ async def place_trade_from_signal(sig: Dict[str, Any]):
         "side_long": is_long,
         "be_set": False,
     }
-
     asyncio.create_task(monitor_and_be_shift(status_state["last_order_info"]))
 
 async def monitor_and_be_shift(info: Dict[str, Any]):
+    assert ex is not None
     symbol = info["symbol"]
     be_set = False
     entry_price = info["entry"]
@@ -202,7 +190,6 @@ async def monitor_and_be_shift(info: Dict[str, Any]):
                         ex.cancel_order(info["sl_id"], symbol)
                     except Exception:
                         pass
-
                 rest_qty = ex.amount_to_precision(symbol, float(info["tp2_qty"]))
                 reduce_side = "sell" if is_long else "buy"
                 be_params = {
@@ -236,7 +223,7 @@ async def monitor_and_be_shift(info: Dict[str, Any]):
             log.warning("Monitor-Loop err: %s", e)
             await asyncio.sleep(POLL_INTERVAL_S)
 
-# ====== Signal-Parser ======
+# ---------- Parser & Telegram ----------
 def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     m = SIG_RE.search(text)
     if not m:
@@ -255,22 +242,43 @@ def parse_signal(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-# ====== Telegram Update-Handler (liest NUR SOURCE_CHAT_ID) ======
 async def on_message(update: Update, context):
     if not update.effective_chat or update.effective_chat.id != SOURCE_CHAT_ID:
         return
     if not update.effective_message or not update.effective_message.text:
         return
-
-    txt = update.effective_message.text
-    sig = parse_signal(txt)
+    sig = parse_signal(update.effective_message.text)
     if not sig:
         return
-
     await post(f"📡 Signal empfangen: {sig['symbol']} {sig['side']} | Entry {sig['entry']} | TP1 {sig['tp1']} | TP2 {sig['tp2']} | SL {sig['sl']}")
     await place_trade_from_signal(sig)
 
-# ====== Startup / Runner ======
+# ---------- Startup ----------
+async def init_exchange_with_retry():
+    global ex
+    if not (MEXC_API_KEY and MEXC_API_SECRET):
+        raise RuntimeError("MEXC_API_KEY / MEXC_API_SECRET fehlen.")
+    tries = 0
+    while tries < 5:
+        try:
+            ex = ccxt.mexc({
+                "apiKey": MEXC_API_KEY,
+                "secret": MEXC_API_SECRET,
+                "enableRateLimit": True,
+                "options": {"defaultType": "swap"},
+            })
+            ex.load_markets()
+            status_state["exchange_ok"] = True
+            log.info("MEXC connected.")
+            return
+        except Exception as e:
+            tries += 1
+            status_state["exchange_ok"] = False
+            status_state["err"] = f"Exchange init failed (try {tries}): {e}"
+            log.warning(status_state["err"])
+            await asyncio.sleep(3)
+    raise RuntimeError("Exchange init failed after retries.")
+
 async def start_polling():
     global tg_app, tg_bot
     if not TG_TOKEN or not SOURCE_CHAT_ID or not DEST_CHAT_ID:
@@ -286,12 +294,20 @@ async def start_polling():
 
 @app.on_event("startup")
 async def _on_start():
-    asyncio.create_task(start_polling())
-    status_state["ok"] = True
+    try:
+        await init_exchange_with_retry()
+        await start_polling()
+        status_state["ok"] = True
+        status_state["err"] = None
+    except Exception as e:
+        status_state["ok"] = False
+        status_state["err"] = str(e)
+        log.exception("Startup error: %s", e)
 
+# ---------- API ----------
 @app.get("/health")
 async def health():
-    return {"ok": True, "running": status_state["running"]}
+    return {"ok": status_state["ok"], "running": status_state["running"], "exchange_ok": status_state["exchange_ok"], "err": status_state["err"]}
 
 @app.get("/status")
 async def status():

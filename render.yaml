@@ -1,4 +1,8 @@
-fastapi==0.111.0
-uvicorn[standard]==0.30.0
-python-telegram-bot==20.7
-ccxt==4.3.89
+services:
+  - type: web
+    name: mexc-executor
+    env: python
+    plan: starter
+    autoDeploy: true
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT

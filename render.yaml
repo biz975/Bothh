@@ -1,8 +1,7 @@
 services:
   - type: worker
-    name: mexc-autotrader
+    name: bothh
     env: python
-    region: frankfurt
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
+    autoDeploy: true

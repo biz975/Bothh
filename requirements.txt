@@ -1,2 +1,4 @@
-ccxt==4.3.77
 python-telegram-bot==20.7
+ccxt==4.3.83
+pytz
+httpx

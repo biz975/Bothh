@@ -1,39 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Telegram → MEXC Auto-Trader (Safe Calls)
-- Liest STRIKT/Safe-Calls aus deinem Channel
-- 50 USDT Margin (fest), 20x, USDT-Perp (isolated)
-- TP1 20%, TP2 50%, TP3 30% (reduce-only)
-- Kein SL (abschalt-/einschaltbar per Flag)
-- DRY-RUN zum Testen (ohne echte Orders)
-"""
-
-import os
-import re
-import time
-import math
-import asyncio
-import logging
-from typing import Optional, Tuple
-
-import ccxt
-from ccxt.base.errors import ExchangeError
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
-
-# ========= DEINE FESTEN ZUGANGSDATEN (auf eigenes Risiko – Repo privat lassen!) =========
-TELEGRAM_BOT_TOKEN   = "8198979676:AAGkXDusQJs_fbrqkOcXuWe998iVKChdhLc"
-# Für Kanäle/Supergroups zum Lesen/Schreiben i.d.R. NEGATIV:
-TELEGRAM_CHANNEL_ID  = -1002896184694   # <- dein Kanal mit den Signalen
-OWNER_USER_ID        = 7427147820       # deine Telegram User-ID (DM/Fehler)
-
-MEXC_API_KEY         = "mx0vglse7KzJVyVbWV"
-MEXC_API_SECRET      = "4479ac9ce0b342738ca7c1882cf47e3f"
-
-# ========= Trading-Settings =========
-MARGIN_USDT          = 50.0             # 50 USDT
-LEVERAGE             = 20
 ALLOW_SLIPPAGE_PCT   = 0.30             # max 0.30% Abweichung Entry↔Markt
 USE_STOP_LOSS        = False            # per Wunsch: kein SL aktiv
 STOP_LOSS_PCT        = 0.0              # ignoriert wenn USE_STOP_LOSS=False

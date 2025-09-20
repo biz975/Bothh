@@ -1,12 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Telegram → MEXC Auto-Trader (Safe Calls)
-- Liest STRIKT/Safe-Calls aus deinem Kanal
-- 50 USDT Margin (fest), 20x, USDT-Perp (isolated)
-- TP1 20%, TP2 50%, TP3 30% (reduce-only)
-- Nach TP1: SL -> Break-even (Entry)
-- DRY_RUN standardmäßig AN (keine echten Orders), via /dryrun_off ausschaltbar
-- python-telegram-bot >= 20 (Application.builder()) – KEIN Updater mehr
+Render Web Service + Telegram Worker
+- Startet FastAPI (für Render Port/Health)
+- Startet den Telegram-Bot als Background-Task beim Server-Start
 """
 
 import os
@@ -14,46 +10,47 @@ import re
 import math
 import asyncio
 import logging
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 
 import ccxt
 from ccxt.base.errors import ExchangeError
 
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, MessageHandler, CommandHandler, ContextTypes, filters
-)
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
-# ========= ENV / Settings =========
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# ========= ENV (Render Dashboard -> Environment Variables) =========
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "0"))
 OWNER_USER_ID       = int(os.getenv("OWNER_USER_ID", "0"))
+MEXC_API_KEY        = os.getenv("MEXC_API_KEY", "")
+MEXC_API_SECRET     = os.getenv("MEXC_API_SECRET", "")
 
-MEXC_API_KEY        = os.getenv("MEXC_API_KEY", "").strip()
-MEXC_API_SECRET     = os.getenv("MEXC_API_SECRET", "").strip()
-
+DRY_RUN             = os.getenv("DRY_RUN", "True").lower() == "true"
 MARGIN_USDT         = float(os.getenv("MARGIN_USDT", "50"))
 LEVERAGE            = int(os.getenv("LEVERAGE", "20"))
 ALLOW_SLIPPAGE_PCT  = float(os.getenv("ALLOW_SLIPPAGE_PCT", "0.30"))
-DRY_RUN             = os.getenv("DRY_RUN", "True").lower() in ("1", "true", "yes")
 
+# ========= Logging =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mexc-autotrader")
 
-# ========= ccxt MEXC (USDT-Perp) =========
+# ========= ccxt (USDT-Perp) =========
 def build_exchange():
-    return ccxt.mexc({
+    ex = ccxt.mexc({
         "apiKey": MEXC_API_KEY,
         "secret": MEXC_API_SECRET,
         "enableRateLimit": True,
-        "options": {"defaultType": "swap"},  # USDT-M Perpetual
+        "options": {"defaultType": "swap"},
     })
+    return ex
 
 ex = build_exchange()
 _seen_message_ids = set()
 
-# ========= Helpers =========
 def to_perp(symbol_txt: str) -> str:
     base, _ = symbol_txt.upper().split("/")
     return f"{base}/USDT:USDT"
@@ -70,19 +67,10 @@ def side_and_reduce(direction: str) -> Tuple[str, str]:
     d = direction.upper()
     return ("buy", "sell") if d == "LONG" else ("sell", "buy")
 
-async def dm_owner(context: ContextTypes.DEFAULT_TYPE, text: str):
-    if not OWNER_USER_ID:
-        return
-    try:
-        await context.bot.send_message(chat_id=OWNER_USER_ID, text=text, parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
-
-# ========= Signal-Parser (STRIKT-Format) =========
 SIGNAL_RE = re.compile(
     r"""(?ix)
-    ^.*?STRIKT.*?                      # Header enthält STRIKT
-    (?P<symbol>[A-Z0-9]+\/USDT).*?\n   # z.B. STX/USDT
+    ^.*?STRIKT.*?
+    (?P<symbol>[A-Z0-9]+\/USDT).*?\n
     .*?➡️\s*\*(?P<side>LONG|SHORT)\*.*?\n
     .*?Entry:\s*`?(?P<entry>\d+(\.\d+)?)`?.*?\n
     .*?TP1:\s*`?(?P<tp1>\d+(\.\d+)?)`?.*?\n
@@ -92,7 +80,19 @@ SIGNAL_RE = re.compile(
     re.DOTALL
 )
 
-# ========= Trading Core =========
+async def dm_owner(context: ContextTypes.DEFAULT_TYPE, text: str):
+    try:
+        if OWNER_USER_ID:
+            await context.bot.send_message(chat_id=OWNER_USER_ID, text=text, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+async def reply(update: Update, text: str):
+    try:
+        await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
 def set_isolated_and_leverage(exchange: ccxt.Exchange, symbol: str, lev: int):
     try:
         exchange.set_margin_mode("isolated", symbol, {"leverage": lev})
@@ -110,100 +110,55 @@ def get_last_price(exchange: ccxt.Exchange, symbol: str) -> float:
     t = exchange.fetch_ticker(symbol)
     return float(t["last"])
 
-def create_be_stop(exchange: ccxt.Exchange, symbol: str, direction: str, entry: float, qty: float):
-    """
-    Break-even SL = genau am Entry, reduceOnly.
-    """
-    stop_side = "sell" if direction.upper()=="LONG" else "buy"
-    params = {
-        "reduceOnly": True,
-        "stopPrice": float(entry),
-        "trigger": "market_price",  # MEXC swap uses trigger type sometimes
-    }
-    # MEXC ccxt: type "stop_market" / params may vary; fallback to create_order with params
-    try:
-        return exchange.create_order(symbol, "stop_market", stop_side, qty, None, params)
-    except Exception:
-        # Fallback: place post-only limit near entry as BE (less ideal). Best effort.
-        return exchange.create_order(symbol, "limit", stop_side, qty, entry, {"reduceOnly": True})
-
 def place_entry_and_tps(exchange: ccxt.Exchange, symbol: str, direction: str,
-                        entry: float, tp1: float, tp2: float, tp3: Optional[float]) -> Dict[str, Any]:
-    """
-    Entry Market, TPs als reduce-only Limits.
-    Nach TP1 wird sofort ein Break-even-Stop (Entry) für Restmenge platziert.
-    """
+                        entry: float, tp1: float, tp2: float, tp3: Optional[float]) -> dict:
     entry_side, reduce_side = side_and_reduce(direction)
-
-    # Positionsgröße
     notion_usdt = MARGIN_USDT * LEVERAGE
     qty_raw = notion_usdt / max(entry, 1e-9)
     qty = round_amount(exchange, symbol, qty_raw)
     if qty <= 0:
-        raise ExchangeError("Menge zu klein nach Rundung – Symbol-Precision prüfen.")
+        raise ExchangeError("Menge zu klein nach Rundung.")
 
-    # Slippage vs Markt
     last = get_last_price(exchange, symbol)
     if not within_slippage(entry, last, ALLOW_SLIPPAGE_PCT):
         raise ExchangeError(f"Preisabweichung zu groß: entry {entry} vs last {last} (>{ALLOW_SLIPPAGE_PCT}%)")
 
-    # Margin-Modus & Leverage
     set_isolated_and_leverage(exchange, symbol, LEVERAGE)
 
-    # Entry
     entry_order = exchange.create_order(symbol, "market", entry_side, qty, None, {"reduceOnly": False})
 
-    # TP-Verteilung
     def tp_qty(frac: float) -> float:
         return round_amount(exchange, symbol, qty * frac)
 
-    # TP1/TP2/TP3
-    tp1_q = tp_qty(0.20)
-    tp2_q = tp_qty(0.50)
+    tp_orders = []
+    tp_orders.append(exchange.create_order(symbol, "limit", reduce_side, tp_qty(0.20), tp1, {"reduceOnly": True}))
+    tp_orders.append(exchange.create_order(symbol, "limit", reduce_side, tp_qty(0.50), tp2, {"reduceOnly": True}))
     rest_share = max(0.0, 1.0 - 0.20 - 0.50)
     last_tp_price = tp3 if tp3 is not None else tp2
-    tp3_q = tp_qty(rest_share)
+    tp_orders.append(exchange.create_order(symbol, "limit", reduce_side, tp_qty(rest_share), last_tp_price, {"reduceOnly": True}))
 
-    tp_orders = []
-    tp_orders.append(exchange.create_order(symbol, "limit", reduce_side, tp1_q, tp1, {"reduceOnly": True}))
-    tp_orders.append(exchange.create_order(symbol, "limit", reduce_side, tp2_q, tp2, {"reduceOnly": True}))
-    tp_orders.append(exchange.create_order(symbol, "limit", reduce_side, tp3_q, last_tp_price, {"reduceOnly": True}))
+    return {"entry_order": entry_order, "tp_orders": tp_orders, "qty": qty, "last": last}
 
-    # Break-even SL (für Restmenge nach TP1)
-    be_qty = round_amount(exchange, symbol, qty - tp1_q)
-    be_order = create_be_stop(exchange, symbol, direction, entry, be_qty)
-
-    return {
-        "entry_order": entry_order,
-        "tp_orders": tp_orders,
-        "be_order": be_order,
-        "qty": qty,
-        "last": last,
-    }
-
-def simulate_entry_and_tps(symbol: str, direction: str, entry: float, tp1: float, tp2: float, tp3: Optional[float]) -> Dict[str, Any]:
+def simulate_entry_and_tps(symbol: str, direction: str, entry: float, tp1: float, tp2: float, tp3: Optional[float]) -> dict:
     notion_usdt = MARGIN_USDT * LEVERAGE
     qty = notion_usdt / max(entry, 1e-9)
-    rest = qty * (1.0 - 0.20)  # nach TP1
     return {
         "entry_side": "buy" if direction.upper()=="LONG" else "sell",
         "reduce_side": "sell" if direction.upper()=="LONG" else "buy",
         "qty": qty,
-        "tp_qtys": {"tp1": qty*0.20, "tp2": qty*0.50, "tp3": qty*0.30},
-        "tp_prices": {"tp1": tp1, "tp2": tp2, "tp3": tp3 if tp3 else tp2},
-        "be_stop": {"side": "sell" if direction.upper()=="LONG" else "buy", "price": entry, "qty": rest},
+        "tp_qtys": {"tp1": qty*0.20, "tp2": qty*0.50, "tp3": qty*(1.0-0.70)},
+        "tp_prices": {"tp1": tp1, "tp2": tp2, "tp3": tp3 if tp3 is not None else tp2},
     }
 
-# ========= Message Handler =========
+# ========== Telegram BOT ==========
+bot_app: Optional[Application] = None  # global, damit wir sie in FastAPI-Startup benutzen
+
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if msg is None:
         return
-
-    # Nur Kanal + (optional) DM vom Owner
     if msg.chat_id not in (TELEGRAM_CHANNEL_ID, OWNER_USER_ID):
         return
-
     if msg.message_id in _seen_message_ids:
         return
     _seen_message_ids.add(msg.message_id)
@@ -233,29 +188,24 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🧪 <b>DRY-RUN</b>\n"
                 f"• Symbol: <code>{perp}</code>\n"
                 f"• Seite: <b>{direction}</b>\n"
-                f"• Entry(ref): <code>{entry}</code>\n"
-                f"• Menge: <code>{sim['qty']:.6f}</code> (50 USDT x 20 / Entry)\n"
-                f"• TP1/TP2/TP3: <code>{tp1}</code> / <code>{tp2}</code> / <code>{tp3 if tp3 else tp2}</code>\n"
-                f"• Verteilung: 20% / 50% / 30%\n"
-                f"• Nach TP1: SL → Break-even (Entry) für Restmenge."
+                f"• Entry: <code>{entry}</code>\n"
+                f"• Menge: <code>{sim['qty']:.6f}</code>\n"
+                f"• TP1/2/3: <code>{tp1}</code> / <code>{tp2}</code> / <code>{tp3 if tp3 else tp2}</code>\n"
+                f"• Verteilung: 20% / 50% / 30%"
             )
             await msg.reply_html(conf)
             await dm_owner(context, conf)
             return
 
-        # ECHT
-        result = await asyncio.to_thread(
-            place_entry_and_tps, ex, perp, direction, entry, tp1, tp2, tp3
-        )
-
+        result = await asyncio.to_thread(place_entry_and_tps, ex, perp, direction, entry, tp1, tp2, tp3)
         conf = (
             f"✅ <b>Trade ausgeführt</b>\n"
             f"• Symbol: <code>{perp}</code>\n"
             f"• Seite: <b>{direction}</b>\n"
             f"• Entry(ref): <code>{entry}</code> | Markt: <code>{result['last']}</code>\n"
             f"• Menge: <code>{result['qty']}</code>\n"
-            f"• TP1/TP2/TP3: <code>{tp1}</code> / <code>{tp2}</code> / <code>{tp3 if tp3 else tp2}</code>\n"
-            f"• Break-even Stop platziert bei <code>{entry}</code> nach TP1."
+            f"• TP1/2/3: <code>{tp1}</code> / <code>{tp2}</code> / <code>{tp3 if tp3 else tp2}</code>\n"
+            f"• Margin: <code>{MARGIN_USDT} USDT</code> @ {LEVERAGE}x"
         )
         await msg.reply_html(conf)
         await dm_owner(context, conf)
@@ -263,25 +213,18 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         err = f"❌ Trade-Fehler: <code>{type(e).__name__}</code> — {e}"
         log.exception(err)
-        try:
-            await msg.reply_html(err)
-        except Exception:
-            pass
+        await msg.reply_html(err)
         await dm_owner(context, err)
 
-# ========= Commands =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != OWNER_USER_ID:
         return
     text = (
-        "🤖 MEXC-Autotrader aktiv.\n"
+        "🤖 Autotrader läuft als Web Service (Render).\n"
         f"• DRY-RUN: {'ON' if DRY_RUN else 'OFF'}\n"
-        "• Kommandos:\n"
-        "  /ping – Verbindungstest\n"
-        "  /dryrun_on – nur simulieren\n"
-        "  /dryrun_off – echte Orders\n"
+        "Kommandos: /ping, /dryrun_on, /dryrun_off, /ticker STX/USDT"
     )
-    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
+    await reply(update, text)
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != OWNER_USER_ID:
@@ -289,54 +232,73 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await asyncio.to_thread(ex.load_markets)
         t = await asyncio.to_thread(ex.fetch_ticker, "BTC/USDT:USDT")
-        await update.effective_chat.send_message(f"🏓 Pong! BTC Perp last: <b>{t['last']}</b>", parse_mode=ParseMode.HTML)
+        await reply(update, f"🏓 Pong! BTC Perp last: <b>{t['last']}</b>")
     except Exception as e:
-        await update.effective_chat.send_message(f"❌ {e}", parse_mode=ParseMode.HTML)
+        await reply(update, f"❌ {e}")
 
 async def cmd_dryrun_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global DRY_RUN
     if update.effective_user and update.effective_user.id != OWNER_USER_ID:
         return
     DRY_RUN = True
-    await update.effective_chat.send_message("🧪 DRY-RUN ist jetzt <b>ON</b>.", parse_mode=ParseMode.HTML)
+    await reply(update, "🧪 DRY-RUN ist jetzt <b>ON</b>.")
 
 async def cmd_dryrun_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global DRY_RUN
     if update.effective_user and update.effective_user.id != OWNER_USER_ID:
         return
     DRY_RUN = False
-    await update.effective_chat.send_message("🚀 DRY-RUN ist jetzt <b>OFF</b>.", parse_mode=ParseMode.HTML)
+    await reply(update, "🚀 DRY-RUN ist jetzt <b>OFF</b> (echte Orders).")
 
-# ========= Bootstrap =========
-async def on_startup(app: Application):
+async def cmd_ticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id != OWNER_USER_ID:
+        return
     try:
+        if not context.args:
+            await reply(update, "Nutze: <code>/ticker STX/USDT</code>")
+            return
+        spot = context.args[0].upper()
+        perp = to_perp(spot)
         await asyncio.to_thread(ex.load_markets)
+        t = await asyncio.to_thread(ex.fetch_ticker, perp)
+        await reply(update, f"📈 {perp} last: <b>{t['last']}</b>  bid: {t['bid']}  ask: {t['ask']}")
     except Exception as e:
-        log.warning(f"load_markets warn: {e}")
-    if OWNER_USER_ID:
-        try:
-            await app.bot.send_message(chat_id=OWNER_USER_ID, text="🤖 MEXC-Autotrader gestartet.", parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+        await reply(update, f"❌ {e}")
 
-def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN fehlt (Env).")
-
+def build_bot_app() -> Application:
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("dryrun_on", cmd_dryrun_on))
     app.add_handler(CommandHandler("dryrun_off", cmd_dryrun_off))
-
+    app.add_handler(CommandHandler("ticker", cmd_ticker))
     app.add_handler(MessageHandler(filters.ALL, on_message))
+    return app
 
-    app.post_init(on_startup)
+# ========== FastAPI + Lifespan: Bot als Background-Task ==========
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global bot_app
+    bot_app = build_bot_app()
+    # Bot im Hintergrund starten
+    bot_task = asyncio.create_task(bot_app.run_polling(close_loop=False))
+    log.info("Telegram bot started (background).")
+    try:
+        yield
+    finally:
+        try:
+            await bot_app.shutdown()
+        except Exception:
+            pass
+        bot_task.cancel()
+        log.info("Telegram bot stopped.")
 
-    log.info("Bot polling …")
-    # Für Render-Worker absolut ok:
-    app.run_polling(close_loop=False)
+app = FastAPI(title="Bothh Web+Worker", lifespan=lifespan)
 
-if __name__ == "__main__":
-    main()
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "web+worker", "dry_run": DRY_RUN}
+
+@app.get("/health")
+async def health():
+    return {"ok": True}

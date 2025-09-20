@@ -3,8 +3,8 @@ services:
     name: mexc-autotrader
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -16,13 +16,11 @@ services:
         sync: false
       - key: MEXC_API_SECRET
         sync: false
-      - key: DRY_RUN
-        value: "True"
       - key: MARGIN_USDT
         value: "50"
       - key: LEVERAGE
         value: "20"
       - key: ALLOW_SLIPPAGE_PCT
         value: "0.30"
-      - key: TZ
-        value: "Europe/Vienna"
+      - key: DRY_RUN
+        value: "True"   # zum Testen; für Live auf "False"

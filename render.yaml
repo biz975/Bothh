@@ -2,6 +2,27 @@ services:
   - type: web
     name: bothh
     env: python
-    plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    region: frankfurt
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: DRY_RUN
+        value: "True"
+      - key: LEVERAGE
+        value: "20"
+      - key: MARGIN_USDT
+        value: "50"
+      - key: ALLOW_SLIPPAGE_PCT
+        value: "0.30"
+      - key: TZ
+        value: "Europe/Vienna"
+      # Die folgenden als 'fromSecret' in Render hinterlegen:
+      - key: MEXC_API_KEY
+        fromSecret: MEXC_API_KEY
+      - key: MEXC_API_SECRET
+        fromSecret: MEXC_API_SECRET
+      - key: TELEGRAM_BOT_TOKEN
+        fromSecret: TELEGRAM_BOT_TOKEN
+      - key: TELEGRAM_CHANNEL_ID
+        fromSecret: TELEGRAM_CHANNEL_ID

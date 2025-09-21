@@ -1,304 +1,245 @@
-# -*- coding: utf-8 -*-
-"""
-Render Web Service + Telegram Worker
-- Startet FastAPI (für Render Port/Health)
-- Startet den Telegram-Bot als Background-Task beim Server-Start
-"""
-
+# app.py
 import os
-import re
-import math
+import time
+import hmac
+import hashlib
+import json
 import asyncio
+from typing import Dict, Any, Optional
+from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel
+import httpx
 import logging
-from typing import Optional, Tuple
 
-import ccxt
-from ccxt.base.errors import ExchangeError
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("mexc-bot")
 
-from fastapi import FastAPI
-from contextlib import asynccontextmanager
+# Config from env
+DRY_RUN = os.getenv("DRY_RUN", "True").lower() in ("1","true","yes")
+MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
+MEXC_API_SECRET = os.getenv("MEXC_API_SECRET", "")
+LEVERAGE = float(os.getenv("LEVERAGE", "20"))
+MARGIN_USDT = float(os.getenv("MARGIN_USDT", "50"))
+ALLOW_SLIPPAGE_PCT = float(os.getenv("ALLOW_SLIPPAGE_PCT", "0.30"))  # percent
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID", "")
+TZ = os.getenv("TZ","Europe/Vienna")
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
+# MEXC endpoints - spot/future endpoints vary; adjust if using linear perpetuals etc.
+MEXC_BASE = "https://contract.mexc.com"  # adjust to your API (e.g., contract vs spot)
 
-# ========= ENV (Render Dashboard -> Environment Variables) =========
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "0"))
-OWNER_USER_ID       = int(os.getenv("OWNER_USER_ID", "0"))
-MEXC_API_KEY        = os.getenv("MEXC_API_KEY", "")
-MEXC_API_SECRET     = os.getenv("MEXC_API_SECRET", "")
+app = FastAPI(title="Signal2MEXC Bot")
 
-DRY_RUN             = os.getenv("DRY_RUN", "True").lower() == "true"
-MARGIN_USDT         = float(os.getenv("MARGIN_USDT", "50"))
-LEVERAGE            = int(os.getenv("LEVERAGE", "20"))
-ALLOW_SLIPPAGE_PCT  = float(os.getenv("ALLOW_SLIPPAGE_PCT", "0.30"))
+class TelegramUpdate(BaseModel):
+    update_id: int
+    channel_post: Optional[Dict[str, Any]] = None
+    message: Optional[Dict[str, Any]] = None
 
-# ========= Logging =========
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("mexc-autotrader")
+# ---------- Helpers ----------
+def log_conf():
+    logger.info(f"DRY_RUN={DRY_RUN}, LEVERAGE={LEVERAGE}, MARGIN_USDT={MARGIN_USDT}, TZ={TZ}")
 
-# ========= ccxt (USDT-Perp) =========
-def build_exchange():
-    ex = ccxt.mexc({
-        "apiKey": MEXC_API_KEY,
-        "secret": MEXC_API_SECRET,
-        "enableRateLimit": True,
-        "options": {"defaultType": "swap"},
-    })
-    return ex
+def mexc_sign(params: Dict[str,str], secret: str) -> str:
+    s = "&".join(f"{k}={v}" for k,v in sorted(params.items()))
+    return hmac.new(secret.encode(), s.encode(), hashlib.sha256).hexdigest()
 
-ex = build_exchange()
-_seen_message_ids = set()
+async def mexc_request(path: str, method="GET", params=None, json_body=None, auth=True):
+    """Minimal wrapper. Adapt to official MEXC auth scheme. For safety: DRY_RUN simulates."""
+    if DRY_RUN:
+        logger.info("[DRY_RUN] mexc_request would call %s %s %s", method, path, params or json_body)
+        return {"code": 200, "data": {"orderId": f"dry_{int(time.time())}"}}
+    url = MEXC_BASE + path
+    headers = {}
+    if auth:
+        ts = str(int(time.time()*1000))
+        headers["ApiKey"] = MEXC_API_KEY
+        sign_params = {"reqTime": ts, "apiKey": MEXC_API_KEY}
+        sign = mexc_sign(sign_params, MEXC_API_SECRET)
+        headers["Signature"] = sign
+    async with httpx.AsyncClient(timeout=20) as client:
+        if method.upper() == "GET":
+            r = await client.get(url, params=params, headers=headers)
+        else:
+            r = await client.post(url, json=json_body, headers=headers)
+        r.raise_for_status()
+        return r.json()
 
-def to_perp(symbol_txt: str) -> str:
-    base, _ = symbol_txt.upper().split("/")
-    return f"{base}/USDT:USDT"
+# ---------- Trade logic ----------
+def calc_quantity(price: float, margin_usdt: float, leverage: float) -> float:
+    """For USDT linear perp: qty ≈ (margin * leverage) / price"""
+    qty = (margin_usdt * leverage) / price
+    return float("{:.6f}".format(qty))  # TODO: round to symbol lot step
 
-def round_amount(exchange: ccxt.Exchange, symbol: str, amount: float) -> float:
-    return float(exchange.amount_to_precision(symbol, amount))
+async def open_position(symbol: str, side: str, entry_price: float, sl_price: Optional[float], tp1_price: float, tp2_price: float):
+    """
+    Open position with MARGIN_USDT & LEVERAGE, set TP1 (30%) + TP2 (70%), SL initial.
+    On TP1 fill -> move SL to break-even (notified via polling/websocket in real impl.).
+    """
+    side_up = side.upper()
+    qty = calc_quantity(entry_price, MARGIN_USDT, LEVERAGE)
+    logger.info("Opening %s %s qty=%.6f @ %.6f", side_up, symbol, qty, entry_price)
 
-def within_slippage(entry: float, last: float, max_pct: float) -> bool:
-    if entry <= 0 or last <= 0: return False
-    diff = abs(last - entry) / entry * 100.0
-    return diff <= max_pct
-
-def side_and_reduce(direction: str) -> Tuple[str, str]:
-    d = direction.upper()
-    return ("buy", "sell") if d == "LONG" else ("sell", "buy")
-
-SIGNAL_RE = re.compile(
-    r"""(?ix)
-    ^.*?STRIKT.*?
-    (?P<symbol>[A-Z0-9]+\/USDT).*?\n
-    .*?➡️\s*\*(?P<side>LONG|SHORT)\*.*?\n
-    .*?Entry:\s*`?(?P<entry>\d+(\.\d+)?)`?.*?\n
-    .*?TP1:\s*`?(?P<tp1>\d+(\.\d+)?)`?.*?\n
-    .*?TP2:\s*`?(?P<tp2>\d+(\.\d+)?)`?.*?\n
-    (?:.*?TP3:\s*`?(?P<tp3>\d+(\.\d+)?)`?.*?\n)?
-    """,
-    re.DOTALL
-)
-
-async def dm_owner(context: ContextTypes.DEFAULT_TYPE, text: str):
-    try:
-        if OWNER_USER_ID:
-            await context.bot.send_message(chat_id=OWNER_USER_ID, text=text, parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
-
-async def reply(update: Update, text: str):
-    try:
-        await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
-
-def set_isolated_and_leverage(exchange: ccxt.Exchange, symbol: str, lev: int):
-    try:
-        exchange.set_margin_mode("isolated", symbol, {"leverage": lev})
-    except Exception:
-        try:
-            exchange.set_margin_mode("isolated", symbol)
-        except Exception:
-            pass
-        try:
-            exchange.set_leverage(lev, symbol)
-        except Exception:
-            pass
-
-def get_last_price(exchange: ccxt.Exchange, symbol: str) -> float:
-    t = exchange.fetch_ticker(symbol)
-    return float(t["last"])
-
-def place_entry_and_tps(exchange: ccxt.Exchange, symbol: str, direction: str,
-                        entry: float, tp1: float, tp2: float, tp3: Optional[float]) -> dict:
-    entry_side, reduce_side = side_and_reduce(direction)
-    notion_usdt = MARGIN_USDT * LEVERAGE
-    qty_raw = notion_usdt / max(entry, 1e-9)
-    qty = round_amount(exchange, symbol, qty_raw)
-    if qty <= 0:
-        raise ExchangeError("Menge zu klein nach Rundung.")
-
-    last = get_last_price(exchange, symbol)
-    if not within_slippage(entry, last, ALLOW_SLIPPAGE_PCT):
-        raise ExchangeError(f"Preisabweichung zu groß: entry {entry} vs last {last} (>{ALLOW_SLIPPAGE_PCT}%)")
-
-    set_isolated_and_leverage(exchange, symbol, LEVERAGE)
-
-    entry_order = exchange.create_order(symbol, "market", entry_side, qty, None, {"reduceOnly": False})
-
-    def tp_qty(frac: float) -> float:
-        return round_amount(exchange, symbol, qty * frac)
-
-    tp_orders = []
-    tp_orders.append(exchange.create_order(symbol, "limit", reduce_side, tp_qty(0.20), tp1, {"reduceOnly": True}))
-    tp_orders.append(exchange.create_order(symbol, "limit", reduce_side, tp_qty(0.50), tp2, {"reduceOnly": True}))
-    rest_share = max(0.0, 1.0 - 0.20 - 0.50)
-    last_tp_price = tp3 if tp3 is not None else tp2
-    tp_orders.append(exchange.create_order(symbol, "limit", reduce_side, tp_qty(rest_share), last_tp_price, {"reduceOnly": True}))
-
-    return {"entry_order": entry_order, "tp_orders": tp_orders, "qty": qty, "last": last}
-
-def simulate_entry_and_tps(symbol: str, direction: str, entry: float, tp1: float, tp2: float, tp3: Optional[float]) -> dict:
-    notion_usdt = MARGIN_USDT * LEVERAGE
-    qty = notion_usdt / max(entry, 1e-9)
-    return {
-        "entry_side": "buy" if direction.upper()=="LONG" else "sell",
-        "reduce_side": "sell" if direction.upper()=="LONG" else "buy",
-        "qty": qty,
-        "tp_qtys": {"tp1": qty*0.20, "tp2": qty*0.50, "tp3": qty*(1.0-0.70)},
-        "tp_prices": {"tp1": tp1, "tp2": tp2, "tp3": tp3 if tp3 is not None else tp2},
+    open_payload = {
+        "symbol": symbol,
+        "side": side_up,
+        "type": "MARKET",
+        "quantity": qty,
+        "leverage": LEVERAGE,
     }
+    resp = await mexc_request("/api/v1/private/order", method="POST", json_body=open_payload, auth=True)
+    order_id = resp.get("data", {}).get("orderId", f"dry_{int(time.time())}")
+    logger.info("Open order_id=%s", order_id)
 
-# ========== Telegram BOT ==========
-bot_app: Optional[Application] = None  # global, damit wir sie in FastAPI-Startup benutzen
+    # Opposite side for TPs/SL
+    close_side = "SELL" if side_up in ("BUY","LONG") else "BUY"
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.effective_message
-    if msg is None:
-        return
-    if msg.chat_id not in (TELEGRAM_CHANNEL_ID, OWNER_USER_ID):
-        return
-    if msg.message_id in _seen_message_ids:
-        return
-    _seen_message_ids.add(msg.message_id)
+    tp1_qty = float("{:.6f}".format(qty * 0.30))
+    tp2_qty = float("{:.6f}".format(qty - tp1_qty))
 
-    text = (msg.text or msg.caption or "").strip()
-    m = SIGNAL_RE.search(text)
-    if not m:
-        return
+    # TP1
+    tp1_payload = {
+        "symbol": symbol,
+        "side": close_side,
+        "type": "LIMIT",
+        "price": tp1_price,
+        "quantity": tp1_qty,
+        "reduceOnly": True
+    }
+    tp1_resp = await mexc_request("/api/v1/private/order", method="POST", json_body=tp1_payload, auth=True)
+    tp1_id = tp1_resp.get("data", {}).get("orderId", f"dry_tp1_{int(time.time())}")
+    logger.info("Placed TP1 id=%s qty=%.6f price=%s", tp1_id, tp1_qty, tp1_price)
 
-    symbol_txt = m.group("symbol").upper()
-    direction  = m.group("side").upper()
-    entry      = float(m.group("entry"))
-    tp1        = float(m.group("tp1"))
-    tp2        = float(m.group("tp2"))
-    tp3        = float(m.group("tp3")) if m.group("tp3") else None
+    # TP2
+    tp2_payload = {
+        "symbol": symbol,
+        "side": close_side,
+        "type": "LIMIT",
+        "price": tp2_price,
+        "quantity": tp2_qty,
+        "reduceOnly": True
+    }
+    tp2_resp = await mexc_request("/api/v1/private/order", method="POST", json_body=tp2_payload, auth=True)
+    tp2_id = tp2_resp.get("data", {}).get("orderId", f"dry_tp2_{int(time.time())}")
+    logger.info("Placed TP2 id=%s qty=%.6f price=%s", tp2_id, tp2_qty, tp2_price)
 
-    perp = to_perp(symbol_txt)
+    # initial SL
+    sl_id = None
+    if sl_price:
+        sl_payload = {
+            "symbol": symbol,
+            "side": close_side,
+            "type": "STOP_MARKET",
+            "stopPrice": sl_price,
+            "quantity": float("{:.6f}".format(qty)),
+            "reduceOnly": True
+        }
+        sl_resp = await mexc_request("/api/v1/private/order", method="POST", json_body=sl_payload, auth=True)
+        sl_id = sl_resp.get("data", {}).get("orderId", f"dry_sl_{int(time.time())}")
+        logger.info("Placed SL id=%s stopPrice=%s", sl_id, sl_price)
 
-    try:
-        await asyncio.to_thread(ex.load_markets)
-        if perp not in ex.markets:
-            raise ExchangeError(f"Symbol nicht gefunden: {perp}")
+    return {"open_id": order_id, "tp1_id": tp1_id, "tp2_id": tp2_id, "sl_id": sl_id, "quantity": qty, "entry_price": entry_price}
 
-        if DRY_RUN:
-            sim = simulate_entry_and_tps(perp, direction, entry, tp1, tp2, tp3)
-            conf = (
-                f"🧪 <b>DRY-RUN</b>\n"
-                f"• Symbol: <code>{perp}</code>\n"
-                f"• Seite: <b>{direction}</b>\n"
-                f"• Entry: <code>{entry}</code>\n"
-                f"• Menge: <code>{sim['qty']:.6f}</code>\n"
-                f"• TP1/2/3: <code>{tp1}</code> / <code>{tp2}</code> / <code>{tp3 if tp3 else tp2}</code>\n"
-                f"• Verteilung: 20% / 50% / 30%"
-            )
-            await msg.reply_html(conf)
-            await dm_owner(context, conf)
-            return
+async def poll_order_status(order_id: str, wait=1, attempts=30):
+    """Polling stub. Replace with real GET order endpoint or WebSocket fills."""
+    for _ in range(attempts):
+        resp = await mexc_request(f"/api/v1/private/order/{order_id}", method="GET", auth=True)
+        data = resp.get("data", {})
+        status = data.get("status", "FILLED" if DRY_RUN else "OPEN")
+        logger.info("Order %s status=%s", order_id, status)
+        if status.upper() in ("FILLED","CANCELED","REJECTED"):
+            return data
+        await asyncio.sleep(wait)
+    return {"status":"UNKNOWN"}
 
-        result = await asyncio.to_thread(place_entry_and_tps, ex, perp, direction, entry, tp1, tp2, tp3)
-        conf = (
-            f"✅ <b>Trade ausgeführt</b>\n"
-            f"• Symbol: <code>{perp}</code>\n"
-            f"• Seite: <b>{direction}</b>\n"
-            f"• Entry(ref): <code>{entry}</code> | Markt: <code>{result['last']}</code>\n"
-            f"• Menge: <code>{result['qty']}</code>\n"
-            f"• TP1/2/3: <code>{tp1}</code> / <code>{tp2}</code> / <code>{tp3 if tp3 else tp2}</code>\n"
-            f"• Margin: <code>{MARGIN_USDT} USDT</code> @ {LEVERAGE}x"
-        )
-        await msg.reply_html(conf)
-        await dm_owner(context, conf)
+# ---------- Telegram webhook ----------
+@app.post("/telegram/webhook")
+async def telegram_webhook(update: TelegramUpdate, request: Request):
+    """Receives Telegram updates (channel_post or message)."""
+    raw = await request.json()
+    logger.info("Telegram update: %s", json.dumps(raw)[:1000])
 
-    except Exception as e:
-        err = f"❌ Trade-Fehler: <code>{type(e).__name__}</code> — {e}"
-        log.exception(err)
-        await msg.reply_html(err)
-        await dm_owner(context, err)
+    text = None
+    if update.channel_post:
+        text = update.channel_post.get("text") or update.channel_post.get("caption")
+    elif update.message:
+        text = update.message.get("text") or update.message.get("caption")
+    if not text:
+        logger.info("No text in update - ignoring")
+        return {"ok": True}
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != OWNER_USER_ID:
-        return
-    text = (
-        "🤖 Autotrader läuft als Web Service (Render).\n"
-        f"• DRY-RUN: {'ON' if DRY_RUN else 'OFF'}\n"
-        "Kommandos: /ping, /dryrun_on, /dryrun_off, /ticker STX/USDT"
+    parsed = parse_signal(text)
+    if not parsed:
+        logger.info("Could not parse signal: %s", text)
+        return {"ok": True, "note": "unparsed"}
+
+    result = await open_position(
+        symbol=parsed["symbol"],
+        side=parsed["side"],
+        entry_price=parsed["price"],
+        sl_price=parsed.get("sl"),
+        tp1_price=parsed["tp1"],
+        tp2_price=parsed["tp2"]
     )
-    await reply(update, text)
+    logger.info("Position opened: %s", result)
+    return {"ok": True, "result": result}
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != OWNER_USER_ID:
-        return
-    try:
-        await asyncio.to_thread(ex.load_markets)
-        t = await asyncio.to_thread(ex.fetch_ticker, "BTC/USDT:USDT")
-        await reply(update, f"🏓 Pong! BTC Perp last: <b>{t['last']}</b>")
-    except Exception as e:
-        await reply(update, f"❌ {e}")
+def parse_signal(text: str) -> Optional[Dict[str, Any]]:
+    """Accepts e.g.: 'BUY BTCUSDT @42000 TP1=42300 TP2=43000 SL=41000'"""
+    t = text.replace(",", " ").replace("\n"," ").upper()
+    tokens = t.split()
+    # side
+    side = "BUY" if ("BUY" in tokens or "LONG" in tokens) else ("SELL" if ("SELL" in tokens or "SHORT" in tokens) else None)
+    # symbol
+    symbol = next((tok for tok in tokens if tok.endswith("USDT")), None)
+    # price (after @)
+    price = None
+    for tok in tokens:
+        if tok.startswith("@"):
+            try:
+                price = float(tok.strip("@"))
+                break
+            except:
+                pass
+    # TP/SL
+    tp1 = tp2 = sl = None
+    for tok in tokens:
+        if tok.startswith("TP1=") or tok.startswith("TP1:"):
+            try: tp1 = float(tok.split("=")[1] if "=" in tok else tok.split(":")[1])
+            except: pass
+        if tok.startswith("TP2=") or tok.startswith("TP2:"):
+            try: tp2 = float(tok.split("=")[1] if "=" in tok else tok.split(":")[1])
+            except: pass
+        if tok.startswith("SL=") or tok.startswith("SL:"):
+            try: sl = float(tok.split("=")[1] if "=" in tok else tok.split(":")[1])
+            except: pass
+    if not price and tp1 and tp2:
+        price = (tp1 + tp2) / 2.0
+    if not (side and symbol and tp1 and tp2 and price):
+        return None
+    return {"side": side, "symbol": symbol, "price": price, "tp1": tp1, "tp2": tp2, "sl": sl}
 
-async def cmd_dryrun_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DRY_RUN
-    if update.effective_user and update.effective_user.id != OWNER_USER_ID:
-        return
-    DRY_RUN = True
-    await reply(update, "🧪 DRY-RUN ist jetzt <b>ON</b>.")
-
-async def cmd_dryrun_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global DRY_RUN
-    if update.effective_user and update.effective_user.id != OWNER_USER_ID:
-        return
-    DRY_RUN = False
-    await reply(update, "🚀 DRY-RUN ist jetzt <b>OFF</b> (echte Orders).")
-
-async def cmd_ticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != OWNER_USER_ID:
-        return
-    try:
-        if not context.args:
-            await reply(update, "Nutze: <code>/ticker STX/USDT</code>")
-            return
-        spot = context.args[0].upper()
-        perp = to_perp(spot)
-        await asyncio.to_thread(ex.load_markets)
-        t = await asyncio.to_thread(ex.fetch_ticker, perp)
-        await reply(update, f"📈 {perp} last: <b>{t['last']}</b>  bid: {t['bid']}  ask: {t['ask']}")
-    except Exception as e:
-        await reply(update, f"❌ {e}")
-
-def build_bot_app() -> Application:
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("dryrun_on", cmd_dryrun_on))
-    app.add_handler(CommandHandler("dryrun_off", cmd_dryrun_off))
-    app.add_handler(CommandHandler("ticker", cmd_ticker))
-    app.add_handler(MessageHandler(filters.ALL, on_message))
-    return app
-
-# ========== FastAPI + Lifespan: Bot als Background-Task ==========
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global bot_app
-    bot_app = build_bot_app()
-    # Bot im Hintergrund starten
-    bot_task = asyncio.create_task(bot_app.run_polling(close_loop=False))
-    log.info("Telegram bot started (background).")
-    try:
-        yield
-    finally:
-        try:
-            await bot_app.shutdown()
-        except Exception:
-            pass
-        bot_task.cancel()
-        log.info("Telegram bot stopped.")
-
-app = FastAPI(title="Bothh Web+Worker", lifespan=lifespan)
-
-@app.get("/")
-async def root():
-    return {"ok": True, "service": "web+worker", "dry_run": DRY_RUN}
-
+# ---------- Health & test ----------
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"status":"ok", "dry_run": DRY_RUN}
+
+@app.post("/test_signal")
+async def test_signal(payload: Dict[str, Any]):
+    required = ["symbol","side","price","tp1","tp2"]
+    if not all(k in payload for k in required):
+        raise HTTPException(status_code=400, detail=f"missing keys, required {required}")
+    res = await open_position(
+        symbol=payload["symbol"],
+        side=payload["side"],
+        entry_price=float(payload["price"]),
+        sl_price=float(payload.get("sl")) if payload.get("sl") else None,
+        tp1_price=float(payload["tp1"]),
+        tp2_price=float(payload["tp2"])
+    )
+    return {"ok": True, "result": res}
+
+# ---------- Startup ----------
+@app.on_event("startup")
+async def startup_event():
+    log_conf()
+    logger.info("Bot starting up. Use /health and /test_signal for quick checks.")
